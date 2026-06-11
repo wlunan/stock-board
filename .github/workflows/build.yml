@@ -1,0 +1,39 @@
+name: Build
+
+on:
+  push:
+    tags:
+      - 'v*'          # 推送 tag 时触发，如 v1.0.0
+  workflow_dispatch:   # 支持手动触发
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Generate resources (icon)
+        run: |
+          go install github.com/tc-hib/go-winres@latest
+          go-winres make
+
+      - name: Build
+        run: go build -ldflags="-s -w -H windowsgui" -o stock-board.exe .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: stock-board
+          path: stock-board.exe
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: stock-board.exe
+          generate_release_notes: true

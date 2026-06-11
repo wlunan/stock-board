@@ -31,10 +31,10 @@
   ],
   "top_most": false,
   "opacity": 70,
-  "pos_x": 896,
-  "pos_y": 295,
+  "pos_x": 79,
+  "pos_y": 801,
   "width": 335,
   "height": 231,
-  "color_mode": "red_up",
+  "color_mode": "green_up",
   "refresh_interval": 5
 }
