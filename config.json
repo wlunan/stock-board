@@ -1,0 +1,40 @@
+{
+  "stocks": [
+    {
+      "code": "sh000001",
+      "name": "上证指数"
+    },
+    {
+      "code": "sz399001",
+      "name": "深证成指"
+    },
+    {
+      "code": "sh000300",
+      "name": "沪深300"
+    },
+    {
+      "code": "sz159995",
+      "name": "芯片ETC华夏"
+    },
+    {
+      "code": "sz159792",
+      "name": "港股互联网"
+    },
+    {
+      "code": "hf_XAU",
+      "name": "伦敦金"
+    },
+    {
+      "code": "gold_rmb",
+      "name": "黄金(人民币)"
+    }
+  ],
+  "top_most": false,
+  "opacity": 70,
+  "pos_x": 896,
+  "pos_y": 295,
+  "width": 335,
+  "height": 231,
+  "color_mode": "red_up",
+  "refresh_interval": 5
+}
