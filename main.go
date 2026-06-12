@@ -55,6 +55,14 @@ var (
 	pScreenToClient      = user32.NewProc("ScreenToClient")
 	pExtTextOutW         = gdi32.NewProc("ExtTextOutW")
 	pMessageBoxW         = user32.NewProc("MessageBoxW")
+	pGetWindowTextW      = user32.NewProc("GetWindowTextW")
+	pSetWindowTextW      = user32.NewProc("SetWindowTextW")
+	pEnableWindow        = user32.NewProc("EnableWindow")
+	pIsDlgButtonChecked  = user32.NewProc("IsDlgButtonChecked")
+	pSetFocus            = user32.NewProc("SetFocus")
+	pGetDlgItem          = user32.NewProc("GetDlgItem")
+	pTranslateMessage    = user32.NewProc("TranslateMessage")
+	pSendMessageA        = user32.NewProc("SendMessageA")
 	pMultiByteToWideChar = kernel32.NewProc("MultiByteToWideChar")
 
 	pSetBkMode        = gdi32.NewProc("SetBkMode")
@@ -105,6 +113,7 @@ const (
 	MENU_TOPMOST     = 40001
 	MENU_OPACITY_UP  = 40002
 	MENU_OPACITY_DOWN= 40003
+	MENU_OPACITY_SET = 40011
 	MENU_REFRESH     = 40004
 	MENU_SETTINGS    = 40005
 	MENU_ABOUT       = 40006
@@ -112,6 +121,7 @@ const (
 	MENU_SCALE_UP    = 40008
 	MENU_SCALE_DOWN  = 40009
 	MENU_COLOR_MODE = 40010
+	MENU_FONT_SIZE  = 40012
 	SWP_NOSIZE      = 0x0001
 	SWP_NOMOVE      = 0x0002
 	SWP_NOZORDER    = 0x0004
@@ -194,6 +204,7 @@ type Config struct {
 	Height          int         `json:"height"`
 	ColorMode       string      `json:"color_mode"`       // "red_up"=涨红跌绿(默认), "green_up"=涨绿跌红
 	RefreshInterval int         `json:"refresh_interval"` // 刷新间隔（秒），默认 5
+	FontSize        int         `json:"font_size"`        // 字体大小，默认 18
 }
 
 var (
@@ -234,16 +245,13 @@ func getConfigPath() string {
 	return filepath.Join(filepath.Dir(exe), "config.json")
 }
 
-func calcSize(stocks int) (int, int) {
-	w := 310
-	if stocks <= 3 {
-		w = 310
-	} else if stocks <= 6 {
-		w = 320
-	} else {
-		w = 330
+func calcSize(stocks int, fontSize int) (int, int) {
+	if fontSize < 10 {
+		fontSize = 18
 	}
-	h := 10 + stocks*22 + 24
+	lineH := fontSize + 4 // 每行高度 = 字体 + 间距
+	w := 10 + fontSize*14 + 80 // 名称列 + 涨跌幅列 + 余量
+	h := 10 + stocks*lineH + 24
 	return w, h
 }
 
@@ -252,10 +260,10 @@ func defaultConfig() Config {
 		{Code: "sh000001", Name: "上证指数"},
 		{Code: "sz399001", Name: "深证成指"},
 		{Code: "sh000300", Name: "沪深300"},
-		{Code: "fx_susdcny", Name: "美元/人民币"},
-		{Code: "fx_sgbpcny", Name: "英镑/人民币"},
+		{Code: "hf_XAU", Name: "伦敦金"},
+		{Code: "gold_rmb", Name: "黄金(人民币)"},
 	}
-	w, h := calcSize(len(stocks))
+	w, h := calcSize(len(stocks), 18)
 	return Config{
 		Stocks:          stocks,
 		TopMost:         true,
@@ -265,6 +273,7 @@ func defaultConfig() Config {
 		Width:           w,
 		Height:          h,
 		RefreshInterval: 5,
+		FontSize:        18,
 	}
 }
 
@@ -288,10 +297,13 @@ func loadConfig() {
 		config.ColorMode = "red_up"
 	}
 	if config.Width == 0 || config.Height == 0 {
-		config.Width, config.Height = calcSize(len(config.Stocks))
+		config.Width, config.Height = calcSize(len(config.Stocks), config.FontSize)
 	}
 	if config.RefreshInterval < 1 {
 		config.RefreshInterval = 5
+	}
+	if config.FontSize < 10 {
+		config.FontSize = 18
 	}
 	// 记录文件修改时间
 	if fi, err := os.Stat(configPath); err == nil {
@@ -544,6 +556,225 @@ func updateWindowStyle() {
 	pInvalidateRect.Call(uintptr(hwnd), 0, 1)
 }
 
+// inputOpacity 弹出输入框让用户输入透明度值，返回 -1 表示取消
+func inputOpacity(parent windows.Handle) int {
+	const (
+		dlgW, dlgH = 280, 150
+		editID     = 1001
+		okID       = 1002
+		cancelID   = 1003
+	)
+	// 用 channel 传递结果
+	resultCh := make(chan int, 1)
+
+	className := u16("StockBoardDlg")
+	hInst, _, _ := kernel32.NewProc("GetModuleHandleW").Call(0)
+
+	var wc WNDCLASSEXW
+	wc.CbSize = uint32(unsafe.Sizeof(wc))
+	wc.LpfnWndProc = windows.NewCallback(func(dlg windows.Handle, msg uint32, wParam, lParam uintptr) uintptr {
+		switch msg {
+		case 0x0111: // WM_COMMAND
+			switch uint32(wParam) & 0xFFFF {
+			case okID:
+				hEdit, _, _ := pGetDlgItem.Call(uintptr(dlg), editID)
+				var buf [16]uint16
+				pGetWindowTextW.Call(hEdit, uintptr(unsafe.Pointer(&buf[0])), 16)
+				s := syscall.UTF16ToString(buf[:])
+				val, err := strconv.Atoi(strings.TrimSpace(s))
+				if err == nil && val >= 0 && val <= 255 {
+					resultCh <- val
+					pDestroyWindow.Call(uintptr(dlg))
+					return 0
+				}
+				pMessageBoxW.Call(uintptr(dlg),
+					uintptr(unsafe.Pointer(u16("请输入 0-255 的整数"))),
+					uintptr(unsafe.Pointer(u16("提示"))), 0)
+			case cancelID:
+				resultCh <- -1
+				pDestroyWindow.Call(uintptr(dlg))
+			}
+		case 0x0002: // WM_DESTROY
+			pPostQuitMessage.Call(0)
+			return 0
+		case 0x0102: // WM_CHAR — 仅允许数字、退格、回车、ESC
+			if wParam != 8 && wParam != 13 && wParam != 27 && (wParam < '0' || wParam > '9') {
+				return 0
+			}
+			ret, _, _ := pDefWindowProcW.Call(uintptr(dlg), uintptr(msg), wParam, lParam)
+			return ret
+		}
+		ret, _, _ := pDefWindowProcW.Call(uintptr(dlg), uintptr(msg), wParam, lParam)
+		return ret
+	})
+	wc.HInstance = windows.Handle(hInst)
+	wc.LpszClassName = className
+	wc.HbrBackground = windows.Handle(15 + 1) // COLOR_BTNFACE+1
+	pRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
+
+	// 居中计算
+	var prc RECT
+	pGetWindowRect.Call(uintptr(parent), uintptr(unsafe.Pointer(&prc)))
+	dx := (prc.Right - prc.Left - dlgW) / 2
+	dy := (prc.Bottom - prc.Top - dlgH) / 2
+
+	dlgRet, _, _ := pCreateWindowExW.Call(
+		0x00010000, // WS_EX_CONTROLPARENT
+		uintptr(unsafe.Pointer(className)),
+		uintptr(unsafe.Pointer(u16("设置透明度"))),
+		0x90C80000, // WS_POPUP | WS_VISIBLE | WS_CAPTION | WS_SYSMENU
+		uintptr(prc.Left+dx), uintptr(prc.Top+dy), dlgW, dlgH,
+		uintptr(parent), 0, hInst, 0)
+	dlg := dlgRet
+
+	// 提示文字
+	pCreateWindowExW.Call(0, uintptr(unsafe.Pointer(u16("STATIC"))),
+		uintptr(unsafe.Pointer(u16("透明度 (0=全透明, 255=不透明):"))),
+		0x50000000, 10, 10, 230, 20, dlg, 0, hInst, 0)
+
+	// 输入框
+	editHwnd, _, _ := pCreateWindowExW.Call(0, uintptr(unsafe.Pointer(u16("EDIT"))),
+		uintptr(unsafe.Pointer(u16(fmt.Sprintf("%d", config.Opacity)))),
+		0x50810080, // WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER|ES_AUTOHSCROLL
+		10, 35, 230, 24, dlg, uintptr(editID), hInst, 0)
+	// 全选文本
+	pSendMessageW.Call(editHwnd, 0x00B1, 0, 0x7FFFFFFF) // EM_SETSEL
+
+	// 按钮
+	pCreateWindowExW.Call(0, uintptr(unsafe.Pointer(u16("BUTTON"))),
+		uintptr(unsafe.Pointer(u16("确定"))),
+		0x50010000, 50, 75, 80, 30, dlg, uintptr(okID), hInst, 0)
+	pCreateWindowExW.Call(0, uintptr(unsafe.Pointer(u16("BUTTON"))),
+		uintptr(unsafe.Pointer(u16("取消"))),
+		0x50010000, 150, 75, 80, 30, dlg, uintptr(cancelID), hInst, 0)
+
+	pShowWindow.Call(dlg, SW_SHOW)
+	pUpdateWindow.Call(dlg)
+
+	// 消息循环
+	var msg MSG
+	for {
+		ret, _, _ := pGetMessageW.Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0)
+		if ret == 0 {
+			break
+		}
+		pTranslateMessage.Call(uintptr(unsafe.Pointer(&msg)))
+		pDispatchMessageW.Call(uintptr(unsafe.Pointer(&msg)))
+	}
+	select {
+	case v := <-resultCh:
+		return v
+	default:
+		return -1
+	}
+}
+
+// inputFontSize 弹出输入框让用户输入字体大小
+func inputFontSize(parent windows.Handle) int {
+	const (
+		dlgW, dlgH = 280, 150
+		editID     = 2001
+		okID       = 2002
+		cancelID   = 2003
+	)
+	resultCh := make(chan int, 1)
+
+	className := u16("StockBoardFontDlg")
+	hInst, _, _ := kernel32.NewProc("GetModuleHandleW").Call(0)
+
+	var wc WNDCLASSEXW
+	wc.CbSize = uint32(unsafe.Sizeof(wc))
+	wc.LpfnWndProc = windows.NewCallback(func(dlg windows.Handle, msg uint32, wParam, lParam uintptr) uintptr {
+		switch msg {
+		case 0x0111: // WM_COMMAND
+			switch uint32(wParam) & 0xFFFF {
+			case okID:
+				hEdit, _, _ := pGetDlgItem.Call(uintptr(dlg), editID)
+				var buf [16]uint16
+				pGetWindowTextW.Call(hEdit, uintptr(unsafe.Pointer(&buf[0])), 16)
+				s := syscall.UTF16ToString(buf[:])
+				val, err := strconv.Atoi(strings.TrimSpace(s))
+				if err == nil && val >= 10 && val <= 48 {
+					resultCh <- val
+					pDestroyWindow.Call(uintptr(dlg))
+					return 0
+				}
+				pMessageBoxW.Call(uintptr(dlg),
+					uintptr(unsafe.Pointer(u16("请输入 10-48 的整数"))),
+					uintptr(unsafe.Pointer(u16("提示"))), 0)
+			case cancelID:
+				resultCh <- -1
+				pDestroyWindow.Call(uintptr(dlg))
+			}
+		case 0x0002: // WM_DESTROY
+			pPostQuitMessage.Call(0)
+			return 0
+		case 0x0102: // WM_CHAR — 仅允许数字、退格、回车、ESC
+			if wParam != 8 && wParam != 13 && wParam != 27 && (wParam < '0' || wParam > '9') {
+				return 0
+			}
+			ret, _, _ := pDefWindowProcW.Call(uintptr(dlg), uintptr(msg), wParam, lParam)
+			return ret
+		}
+		ret, _, _ := pDefWindowProcW.Call(uintptr(dlg), uintptr(msg), wParam, lParam)
+		return ret
+	})
+	wc.HInstance = windows.Handle(hInst)
+	wc.LpszClassName = className
+	wc.HbrBackground = windows.Handle(15 + 1)
+	pRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
+
+	var prc RECT
+	pGetWindowRect.Call(uintptr(parent), uintptr(unsafe.Pointer(&prc)))
+	dx := (prc.Right - prc.Left - dlgW) / 2
+	dy := (prc.Bottom - prc.Top - dlgH) / 2
+
+	dlgRet, _, _ := pCreateWindowExW.Call(
+		0x00010000,
+		uintptr(unsafe.Pointer(className)),
+		uintptr(unsafe.Pointer(u16("设置字体大小"))),
+		0x90C80000,
+		uintptr(prc.Left+dx), uintptr(prc.Top+dy), dlgW, dlgH,
+		uintptr(parent), 0, hInst, 0)
+	dlg := dlgRet
+
+	pCreateWindowExW.Call(0, uintptr(unsafe.Pointer(u16("STATIC"))),
+		uintptr(unsafe.Pointer(u16("字体大小 (10-48，默认 18):"))),
+		0x50000000, 10, 10, 230, 20, dlg, 0, hInst, 0)
+
+	editHwnd, _, _ := pCreateWindowExW.Call(0, uintptr(unsafe.Pointer(u16("EDIT"))),
+		uintptr(unsafe.Pointer(u16(fmt.Sprintf("%d", config.FontSize)))),
+		0x50810080,
+		10, 35, 230, 24, dlg, uintptr(editID), hInst, 0)
+	pSendMessageW.Call(editHwnd, 0x00B1, 0, 0x7FFFFFFF)
+
+	pCreateWindowExW.Call(0, uintptr(unsafe.Pointer(u16("BUTTON"))),
+		uintptr(unsafe.Pointer(u16("确定"))),
+		0x50010000, 50, 75, 80, 30, dlg, uintptr(okID), hInst, 0)
+	pCreateWindowExW.Call(0, uintptr(unsafe.Pointer(u16("BUTTON"))),
+		uintptr(unsafe.Pointer(u16("取消"))),
+		0x50010000, 150, 75, 80, 30, dlg, uintptr(cancelID), hInst, 0)
+
+	pShowWindow.Call(dlg, SW_SHOW)
+	pUpdateWindow.Call(dlg)
+
+	var msg MSG
+	for {
+		ret, _, _ := pGetMessageW.Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0)
+		if ret == 0 {
+			break
+		}
+		pTranslateMessage.Call(uintptr(unsafe.Pointer(&msg)))
+		pDispatchMessageW.Call(uintptr(unsafe.Pointer(&msg)))
+	}
+	select {
+	case v := <-resultCh:
+		return v
+	default:
+		return -1
+	}
+}
+
 func showMenu() {
 	menu, _, _ := pCreatePopupMenu.Call()
 	topText := "\u7f6e\u9876: \u5173"
@@ -552,8 +783,7 @@ func showMenu() {
 	}
 	pAppendMenuW.Call(menu, MF_STRING, MENU_TOPMOST, uintptr(unsafe.Pointer(u16(topText))))
 	pAppendMenuW.Call(menu, MF_SEPARATOR, 0, 0)
-	pAppendMenuW.Call(menu, MF_STRING, MENU_OPACITY_UP, uintptr(unsafe.Pointer(u16("\u900f\u660e\u5ea6 +"))))
-	pAppendMenuW.Call(menu, MF_STRING, MENU_OPACITY_DOWN, uintptr(unsafe.Pointer(u16("\u900f\u660e\u5ea6 -"))))
+	pAppendMenuW.Call(menu, MF_STRING, MENU_OPACITY_SET, uintptr(unsafe.Pointer(u16("\u900f\u660e\u5ea6..."))))
 	pAppendMenuW.Call(menu, MF_SEPARATOR, 0, 0)
 	pAppendMenuW.Call(menu, MF_STRING, MENU_SCALE_UP, uintptr(unsafe.Pointer(u16("\u653e\u5927"))))
 	pAppendMenuW.Call(menu, MF_STRING, MENU_SCALE_DOWN, uintptr(unsafe.Pointer(u16("\u7f29\u5c0f"))))
@@ -563,6 +793,7 @@ func showMenu() {
 		colorText = "\u6da8\u8dcc\u989c\u8272: \u6da8\u7eff\u8dcc\u7ea2"
 	}
 	pAppendMenuW.Call(menu, MF_STRING, MENU_COLOR_MODE, uintptr(unsafe.Pointer(u16(colorText))))
+	pAppendMenuW.Call(menu, MF_STRING, MENU_FONT_SIZE, uintptr(unsafe.Pointer(u16("\u5b57\u4f53\u5927\u5c0f..."))))
 	pAppendMenuW.Call(menu, MF_SEPARATOR, 0, 0)
 	pAppendMenuW.Call(menu, MF_STRING, MENU_REFRESH, uintptr(unsafe.Pointer(u16("\u5237\u65b0"))))
 	pAppendMenuW.Call(menu, MF_STRING, MENU_SETTINGS, uintptr(unsafe.Pointer(u16("\u7f16\u8f91\u80a1\u7968..."))))
@@ -655,7 +886,7 @@ func wndProc(hwnd windows.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 		brush, _, _ := pCreateSolidBrush.Call(uintptr(rgb(22, 22, 38)))
 		pFillRect.Call(hdc, uintptr(unsafe.Pointer(&rc)), brush)
 		pDeleteObject.Call(brush)
-		font, _, _ := pCreateFontW.Call(18, 0, 0, 0, FW_NORMAL, 0, 0, 0,
+		font, _, _ := pCreateFontW.Call(uintptr(config.FontSize), 0, 0, 0, FW_NORMAL, 0, 0, 0,
 			1, 0, 0, 0, 0, uintptr(unsafe.Pointer(u16("SimSun"))))
 		oldFont, _, _ := pSelectObject.Call(hdc, font)
 		stockMu.RLock()
@@ -663,12 +894,13 @@ func wndProc(hwnd windows.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 		copy(stocks, stockData)
 		fetchOK := lastFetchOK
 		stockMu.RUnlock()
+		lineH := int32(config.FontSize + 4) // 行高 = 字体 + 间距
 		y := int32(10)
 		// 网络错误提示
 		if !fetchOK && len(stocks) > 0 {
 			pSetTextColor.Call(hdc, 0x006666FF)
 			drawStr(hdc, 10, y, "网络异常")
-			y += 22
+			y += lineH
 		}
 		for _, s := range stocks {
 			color := uint32(0x00888888)
@@ -688,10 +920,13 @@ func wndProc(hwnd windows.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 				}
 			}
 			pSetTextColor.Call(hdc, uintptr(color))
-			drawStr(hdc, 10, y, s.Name)
-			drawStr(hdc, 150, y, fmt.Sprintf("%.3f", s.Price))
-			drawStr(hdc, 230, y, fmt.Sprintf("%s%.2f%%", sign, s.ChangePct))
-			y += 22
+			nameX := int32(10)
+			priceX := int32(10 + config.FontSize*8)  // 名称列宽约 8 个字符
+			changeX := int32(10 + config.FontSize*14) // 涨跌幅列
+			drawStr(hdc, nameX, y, s.Name)
+			drawStr(hdc, priceX, y, fmt.Sprintf("%.3f", s.Price))
+			drawStr(hdc, changeX, y, fmt.Sprintf("%s%.2f%%", sign, s.ChangePct))
+			y += lineH
 		}
 		pSetTextColor.Call(hdc, 0x00555555)
 		drawStr(hdc, 10, y+6, time.Now().Format("15:04:05"))
@@ -712,13 +947,14 @@ func wndProc(hwnd windows.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 			codes[i] = s.Code
 		}
 		stockMu.RUnlock()
-		// 起始 y=10，每行 22px，如果网络异常则第一行是提示，偏移+1
+		// 起始 y=10，行高 = fontSize+4，如果网络异常则第一行是提示
 		startY := int32(10)
+		lineH := int32(config.FontSize + 4)
 		if !lastFetchOK && n > 0 {
-			startY = 32
+			startY += lineH
 		}
 		if n > 0 && yPos >= startY {
-			row := int((yPos - startY) / 22)
+			row := int((yPos - startY) / lineH)
 			if row >= 0 && row < len(codes) {
 				go openStockURL(codes[row])
 			}
@@ -739,14 +975,13 @@ func wndProc(hwnd windows.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 			config.TopMost = !config.TopMost
 			updateWindowStyle()
 			saveConfig()
-		case MENU_OPACITY_UP:
-			config.Opacity = max(config.Opacity-20, 50)
-			updateWindowStyle()
-			saveConfig()
-		case MENU_OPACITY_DOWN:
-			config.Opacity = min(config.Opacity+20, 255)
-			updateWindowStyle()
-			saveConfig()
+		case MENU_OPACITY_SET:
+			val := inputOpacity(hwnd)
+			if val >= 0 {
+				config.Opacity = val
+				updateWindowStyle()
+				saveConfig()
+			}
 		case MENU_REFRESH:
 			go refreshData()
 		case MENU_SETTINGS:
@@ -775,6 +1010,15 @@ func wndProc(hwnd windows.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 			}
 			pInvalidateRect.Call(uintptr(hwnd), 0, 1)
 			saveConfig()
+		case MENU_FONT_SIZE:
+			val := inputFontSize(hwnd)
+			if val >= 0 {
+				config.FontSize = val
+				config.Width, config.Height = calcSize(len(config.Stocks), config.FontSize)
+				pSetWindowPos.Call(uintptr(hwnd), 0, 0, 0, uintptr(config.Width), uintptr(config.Height), SWP_NOMOVE|SWP_NOZORDER|SWP_SHOWWINDOW)
+				pInvalidateRect.Call(uintptr(hwnd), 0, 1)
+				saveConfig()
+			}
 		case MENU_ABOUT:
 			pMessageBoxW.Call(uintptr(hwnd),
 				uintptr(unsafe.Pointer(u16("Stock Board v1.0\n作者: lunan\nhttps://github.com/lunan/stock-board"))),

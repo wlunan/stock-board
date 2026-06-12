@@ -59,6 +59,7 @@ go build -ldflags="-s -w -H windowsgui" -o stock-board.exe
 | `height` | `int` | 自动 | 窗口高度（像素，首次按股票数计算） |
 | `color_mode` | `string` | `"red_up"` | 涨跌颜色：`"red_up"`（涨红跌绿）/ `"green_up"`（涨绿跌红） |
 | `refresh_interval` | `int` | `5` | 自动刷新间隔（秒），最小 1 |
+| `font_size` | `int` | `18` | 字体大小（像素），范围 10-48 |
 
 ### 示例
 

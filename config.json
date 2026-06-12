@@ -31,10 +31,11 @@
   ],
   "top_most": false,
   "opacity": 70,
-  "pos_x": 79,
-  "pos_y": 801,
-  "width": 335,
-  "height": 231,
-  "color_mode": "green_up",
-  "refresh_interval": 5
+  "pos_x": 68,
+  "pos_y": 855,
+  "width": 370,
+  "height": 202,
+  "color_mode": "red_up",
+  "refresh_interval": 5,
+  "font_size": 20
 }
