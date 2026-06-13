@@ -24,6 +24,7 @@ var (
 	user32   = windows.NewLazySystemDLL("user32.dll")
 	kernel32 = windows.NewLazySystemDLL("kernel32.dll")
 	gdi32    = windows.NewLazySystemDLL("gdi32.dll")
+	shell32  = windows.NewLazySystemDLL("shell32.dll")
 
 	pCreateWindowExW     = user32.NewProc("CreateWindowExW")
 	pDefWindowProcW      = user32.NewProc("DefWindowProcW")
@@ -71,6 +72,10 @@ var (
 	pCreateFontW      = gdi32.NewProc("CreateFontW")
 	pSelectObject     = gdi32.NewProc("SelectObject")
 	pDeleteObject     = gdi32.NewProc("DeleteObject")
+
+	// 系统托盘
+	pShellNotifyIcon  = shell32.NewProc("Shell_NotifyIconW")
+	pLoadIconW        = user32.NewProc("LoadIconW")
 )
 
 const (
@@ -122,12 +127,26 @@ const (
 	MENU_SCALE_DOWN  = 40009
 	MENU_COLOR_MODE = 40010
 	MENU_FONT_SIZE  = 40012
+	MENU_TRAY_SHOW  = 40020
+	MENU_TRAY_EXIT  = 40021
 	SWP_NOSIZE      = 0x0001
 	SWP_NOMOVE      = 0x0002
 	SWP_NOZORDER    = 0x0004
 	SWP_SHOWWINDOW  = 0x0040
 	ETO_OPAQUE       = 0x0002
 	CP936            = 936
+
+	// 系统托盘常量
+	WM_TRAYICON      = WM_USER + 2
+	NIM_ADD          = 0x00000000
+	NIM_MODIFY       = 0x00000001
+	NIM_DELETE       = 0x00000002
+	NIF_MESSAGE      = 0x00000001
+	NIF_ICON         = 0x00000002
+	NIF_TIP          = 0x00000004
+	SW_HIDE          = 0
+	SW_RESTORE       = 9
+	IDI_APPLICATION  = 32512
 )
 
 type WNDCLASSEXW struct {
@@ -194,6 +213,25 @@ type StockData struct {
 	ChangePct float64
 }
 
+// NOTIFYICONDATA 系统托盘图标数据结构
+type NOTIFYICONDATA struct {
+	CbSize           uint32
+	HWnd             uintptr
+	UID              uint32
+	UFlags           uint32
+	UCallbackMessage uint32
+	HIcon            uintptr
+	SzTip            [128]uint16
+	DwState          uint32
+	DwStateMask      uint32
+	SzInfo           [256]uint16
+	UVersion         uint32
+	SzInfoTitle      [64]uint16
+	DwInfoFlags      uint32
+	GuidItem         [16]byte
+	HBalloonIcon     uintptr
+}
+
 type Config struct {
 	Stocks          []StockItem `json:"stocks"`
 	TopMost         bool        `json:"top_most"`
@@ -219,6 +257,7 @@ var (
 	stopOnce   sync.Once
 	configMTime time.Time // config 文件最后修改时间，用于热加载
 	lastFetchOK bool      // 最近一次行情获取是否成功
+	windowHidden bool    // 窗口是否隐藏到托盘
 )
 
 func u16(s string) *uint16 {
@@ -332,6 +371,54 @@ func decodeSinaBody(body []byte) string {
 	return syscall.UTF16ToString(buf)
 }
 
+func isAShareTradingTime() bool {
+	now := time.Now()
+	wd := now.Weekday()
+	if wd == time.Saturday || wd == time.Sunday {
+		return false
+	}
+	h, m := now.Hour(), now.Minute()
+	min := h*60 + m
+	return (min >= 9*60+30 && min < 11*60+30) || (min >= 13*60 && min < 15*60)
+}
+
+func isHKTradingTime() bool {
+	now := time.Now()
+	wd := now.Weekday()
+	if wd == time.Saturday || wd == time.Sunday {
+		return false
+	}
+	h, m := now.Hour(), now.Minute()
+	min := h*60 + m
+	return (min >= 9*60+30 && min < 12*60) || (min >= 13*60 && min < 16*60)
+}
+
+func isGoldTradingTime() bool {
+	now := time.Now()
+	wd := now.Weekday()
+	if wd == time.Saturday {
+		return false
+	}
+	if wd == time.Sunday {
+		h := now.Hour()
+		if h < 7 {
+			return false
+		}
+	}
+	h, m := now.Hour(), now.Minute()
+	min := h*60 + m
+	if wd == time.Friday {
+		if min >= 7*60 {
+			return true
+		}
+		return min < 6*60
+	}
+	if min >= 7*60 {
+		return true
+	}
+	return min < 6*60
+}
+
 func fetchGoldPrice() StockData {
 	var sd StockData
 	resp, err := httpClient.Get("https://tmini.net/api/gold-price?type=json")
@@ -433,42 +520,77 @@ func refreshData() {
 	}
 	defer refreshMu.Unlock()
 
-	var codes []string
-	var goldItems []int // 记录 gold_rmb 在 stocks 中的索引
+	var aShareCodes []string
+	var hkCodes []string
+	var goldIndices []int
 	nameMap := make(map[string]string)
 	for i, s := range config.Stocks {
-		if s.Code == "gold_rmb" {
-			goldItems = append(goldItems, i)
-			continue
+		switch {
+		case s.Code == "gold_rmb":
+			goldIndices = append(goldIndices, i)
+		case strings.HasPrefix(s.Code, "rt_hk"):
+			hkCodes = append(hkCodes, s.Code)
+			nameMap[s.Code] = s.Name
+		default:
+			aShareCodes = append(aShareCodes, s.Code)
+			nameMap[s.Code] = s.Name
 		}
-		codes = append(codes, s.Code)
-		nameMap[s.Code] = s.Name
 	}
-	data := fetchSinaData(codes)
-	goldData := fetchGoldPrice()
-	// 判断是否有数据返回（至少一个品种有价格）
+
+	fetchAShare := len(aShareCodes) > 0 && isAShareTradingTime()
+	fetchHK := len(hkCodes) > 0 && isHKTradingTime()
+	fetchGold := len(goldIndices) > 0 && isGoldTradingTime()
+	if !fetchAShare && !fetchHK && !fetchGold {
+		return
+	}
+
+	var data map[string]StockData
+	var goldData StockData
+	data = make(map[string]StockData)
+	if fetchAShare {
+		for k, v := range fetchSinaData(aShareCodes) {
+			data[k] = v
+		}
+	}
+	if fetchHK {
+		for k, v := range fetchSinaData(hkCodes) {
+			data[k] = v
+		}
+	}
+	if fetchGold {
+		goldData = fetchGoldPrice()
+	}
 	sinaOK := len(data) > 0
-	goldOK := goldData.Price > 0
+	goldOK := fetchGold && goldData.Price > 0
+	if !sinaOK && !goldOK {
+		return
+	}
+
 	newStocks := make([]StockData, len(config.Stocks))
-	// 先按顺序填充 Sina 数据
-	sinaIdx := 0
 	for i, s := range config.Stocks {
-		if s.Code == "gold_rmb" {
-			newStocks[i] = goldData
-			continue
-		}
-		code := s.Code
-		if sinaIdx < len(codes) {
-			code = codes[sinaIdx]
-			sinaIdx++
-		}
-		if sd, ok := data[code]; ok {
-			if sd.Name == "" {
-				sd.Name = nameMap[code]
+		switch {
+		case s.Code == "gold_rmb":
+			if fetchGold {
+				newStocks[i] = goldData
 			}
-			newStocks[i] = sd
-		} else {
-			newStocks[i] = StockData{Name: nameMap[code]}
+		case strings.HasPrefix(s.Code, "rt_hk"):
+			if fetchHK {
+				if sd, ok := data[s.Code]; ok {
+					if sd.Name == "" {
+						sd.Name = nameMap[s.Code]
+					}
+					newStocks[i] = sd
+				}
+			}
+		default:
+			if fetchAShare {
+				if sd, ok := data[s.Code]; ok {
+					if sd.Name == "" {
+						sd.Name = nameMap[s.Code]
+					}
+					newStocks[i] = sd
+				}
+			}
 		}
 	}
 	stockMu.Lock()
@@ -798,6 +920,7 @@ func showMenu() {
 	pAppendMenuW.Call(menu, MF_STRING, MENU_REFRESH, uintptr(unsafe.Pointer(u16("\u5237\u65b0"))))
 	pAppendMenuW.Call(menu, MF_STRING, MENU_SETTINGS, uintptr(unsafe.Pointer(u16("\u7f16\u8f91\u80a1\u7968..."))))
 	pAppendMenuW.Call(menu, MF_SEPARATOR, 0, 0)
+	pAppendMenuW.Call(menu, MF_STRING, MENU_TRAY_SHOW, uintptr(unsafe.Pointer(u16("\u6700\u5c0f\u5316\u5230\u6258\u76d8"))))
 	pAppendMenuW.Call(menu, MF_STRING, MENU_ABOUT, uintptr(unsafe.Pointer(u16("\u5173\u4e8e"))))
 	pAppendMenuW.Call(menu, MF_STRING, MENU_EXIT, uintptr(unsafe.Pointer(u16("\u9000\u51fa"))))
 	var pt POINT
@@ -808,7 +931,6 @@ func showMenu() {
 }
 
 func openSettings() {
-	shell32 := windows.NewLazySystemDLL("shell32.dll")
 	shell32.NewProc("ShellExecuteW").Call(0,
 		uintptr(unsafe.Pointer(u16("open"))),
 		uintptr(unsafe.Pointer(u16("notepad.exe"))),
@@ -828,15 +950,79 @@ func openStockURL(code string) {
 	default:
 		url = "https://finance.sina.com.cn"
 	}
-	shell32 := windows.NewLazySystemDLL("shell32.dll")
 	shell32.NewProc("ShellExecuteW").Call(0,
 		uintptr(unsafe.Pointer(u16("open"))),
 		uintptr(unsafe.Pointer(u16(url))),
 		0, 0, SW_SHOW)
 }
 
+// addTrayIcon 创建系统托盘图标
+func addTrayIcon() {
+	var nid NOTIFYICONDATA
+	nid.CbSize = uint32(unsafe.Sizeof(nid))
+	nid.HWnd = uintptr(hwnd)
+	nid.UID = 1
+	nid.UFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+	nid.UCallbackMessage = WM_TRAYICON
+	hInst, _, _ := kernel32.NewProc("GetModuleHandleW").Call(0)
+	hIcon, _, _ := pLoadIconW.Call(hInst, uintptr(unsafe.Pointer(u16("APP"))))
+	if hIcon == 0 {
+		hIcon, _, _ = pLoadIconW.Call(0, IDI_APPLICATION)
+	}
+	nid.HIcon = hIcon
+	copy(nid.SzTip[:], u16s("股票摸鱼看板"))
+	pShellNotifyIcon.Call(NIM_ADD, uintptr(unsafe.Pointer(&nid)))
+}
+
+// removeTrayIcon 移除系统托盘图标
+func removeTrayIcon() {
+	var nid NOTIFYICONDATA
+	nid.CbSize = uint32(unsafe.Sizeof(nid))
+	nid.HWnd = uintptr(hwnd)
+	nid.UID = 1
+	pShellNotifyIcon.Call(NIM_DELETE, uintptr(unsafe.Pointer(&nid)))
+}
+
+// toggleWindowVisibility 切换窗口显示/隐藏
+func toggleWindowVisibility() {
+	if windowHidden {
+		pShowWindow.Call(uintptr(hwnd), SW_SHOW)
+		pSetForegroundWindow.Call(uintptr(hwnd))
+		pInvalidateRect.Call(uintptr(hwnd), 0, 1)
+		windowHidden = false
+	} else {
+		pShowWindow.Call(uintptr(hwnd), SW_HIDE)
+		windowHidden = true
+	}
+}
+
+// showTrayMenu 显示托盘右键菜单
+func showTrayMenu() {
+	menu, _, _ := pCreatePopupMenu.Call()
+	showText := "\u9690\u85cf\u4e3b\u7a97\u53e3" // 隐藏主窗口
+	if windowHidden {
+		showText = "\u663e\u793a\u4e3b\u7a97\u53e3" // 显示主窗口
+	}
+	pAppendMenuW.Call(menu, MF_STRING, MENU_TRAY_SHOW, uintptr(unsafe.Pointer(u16(showText))))
+	pAppendMenuW.Call(menu, MF_SEPARATOR, 0, 0)
+	pAppendMenuW.Call(menu, MF_STRING, MENU_TRAY_EXIT, uintptr(unsafe.Pointer(u16("\u9000\u51fa"))))
+	var pt POINT
+	pGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
+	pSetForegroundWindow.Call(uintptr(hwnd))
+	pTrackPopupMenu.Call(menu, TPM_RIGHTBUTTON|TPM_BOTTOMALIGN, uintptr(pt.X), uintptr(pt.Y), 0, uintptr(hwnd), 0)
+	pDestroyMenu.Call(menu)
+}
+
 func wndProc(hwnd windows.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 	switch msg {
+	case WM_TRAYICON:
+		switch lParam {
+		case WM_LBUTTONDBLCLK:
+			toggleWindowVisibility()
+		case WM_RBUTTONDOWN:
+			showTrayMenu()
+		}
+		return 0
 	case WM_NCCALCSIZE:
 		// 让非客户区尺寸为零，消除白色边框（WS_THICKFRAME 拖拽缩放仍生效）
 		return 0
@@ -969,7 +1155,7 @@ func wndProc(hwnd windows.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 		return 0
 	case WM_COMMAND:
 		switch uint32(wParam) & 0xFFFF {
-		case MENU_EXIT:
+		case MENU_EXIT, MENU_TRAY_EXIT:
 			pDestroyWindow.Call(uintptr(hwnd))
 		case MENU_TOPMOST:
 			config.TopMost = !config.TopMost
@@ -1019,9 +1205,11 @@ func wndProc(hwnd windows.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 				pInvalidateRect.Call(uintptr(hwnd), 0, 1)
 				saveConfig()
 			}
+		case MENU_TRAY_SHOW:
+			toggleWindowVisibility()
 		case MENU_ABOUT:
 			pMessageBoxW.Call(uintptr(hwnd),
-				uintptr(unsafe.Pointer(u16("Stock Board v1.0\n作者: lunan\nhttps://github.com/lunan/stock-board"))),
+				uintptr(unsafe.Pointer(u16("Stock Board v1.3\n作者: lunan\nhttps://github.com/wlunan/stock-board"))),
 				uintptr(unsafe.Pointer(u16("关于"))), 0)
 		}
 		return 0
@@ -1036,6 +1224,7 @@ func wndProc(hwnd windows.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 		saveConfig()
 		return 0
 	case WM_DESTROY:
+		removeTrayIcon()
 		stopOnce.Do(func() { close(appDone) })
 		var rc RECT
 		pGetWindowRect.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&rc)))
@@ -1089,6 +1278,7 @@ func main() {
 	pSetLayeredWindow.Call(uintptr(hwnd), 0, uintptr(config.Opacity), LWA_ALPHA)
 	pShowWindow.Call(uintptr(hwnd), SW_SHOW)
 	pUpdateWindow.Call(uintptr(hwnd))
+	addTrayIcon()
 	go dataWorker()
 	var msg MSG
 	for {
