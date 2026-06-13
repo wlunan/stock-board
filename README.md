@@ -32,6 +32,12 @@
 git clone https://github.com/lunan/stock-board.git
 cd stock-board
 go mod tidy
+
+# 生成资源文件（图标 + 清单）
+go install github.com/tc-hib/go-winres@latest
+go-winres make
+
+# 编译
 go build -ldflags="-s -w -H windowsgui" -o stock-board.exe
 ```
 
@@ -42,6 +48,25 @@ go build -ldflags="-s -w -H windowsgui" -o stock-board.exe
 | `-s` | 去掉符号表，减小体积 |
 | `-w` | 去掉调试信息，减小体积 |
 | `-H windowsgui` | Windows GUI 子系统，不弹控制台窗口 |
+
+## 项目结构
+
+```
+stock-board/
+├── main.go              # 全部源码（窗口、绘图、数据、托盘、菜单）
+├── config.json          # 用户配置（股票列表、窗口参数）
+├── go.mod / go.sum      # Go 模块定义
+├── winres/
+│   ├── winres.json      # go-winres 资源配置（图标、清单）
+│   ├── icon.png         # 图标源文件（PNG）
+│   └── icon.ico         # 转换后的 Windows 图标
+├── rsrc_windows_*.syso  # 编译时嵌入的资源（图标+清单）
+├── docs/design.md       # 设计文档
+├── .github/workflows/
+│   └── build.yml        # GitHub Actions 自动构建（tag 触发 Release）
+├── README.md
+└── LICENSE              # MIT 许可证
+```
 
 ## 配置
 
@@ -117,9 +142,11 @@ GET https://tmini.net/api/gold-price?type=json
 | 菜单项 | 功能 |
 |--------|------|
 | 置顶: 开/关 | 切换窗口置顶状态 |
-| 透明度 +/- | 调节窗口透明度 |
+| 透明度... | 弹窗输入精确透明度值 |
 | 放大 / 缩小 | 按比例缩放窗口 |
-| 涨跌颜色 | 切换涨红跌绿 / 涨绿跌红 |
+| 涨跌颜色... | 切换涨红跌绿 / 涨绿跌红 |
+| 字体大小... | 弹窗输入字体大小（10-48） |
+| 最小化到托盘 | 隐藏窗口到系统托盘 |
 | 刷新 | 立即刷新行情 |
 | 编辑股票... | 用记事本打开 `config.json` |
 | 关于 | 版本和作者信息 |
@@ -132,14 +159,17 @@ GET https://tmini.net/api/gold-price?type=json
 - **网络**：标准库 `net/http`
 - **打包**：单文件 exe，约 5MB
 
-## 待办 
+## 待办
 
 - [x] 双击行情行打开对应网页
 - [x] 行情异常/网络错误状态提示
+- [x] 自定义刷新间隔（config.json `refresh_interval`）
+- [x] 自定义字体大小（config.json `font_size` + 右键菜单）
+- [x] 系统托盘（最小化/双击恢复/托盘右键菜单）
+- [ ] 全局快捷键（Ctrl+Shift+H 隐藏/显示）
 - [ ] 复制行情到剪贴板
 - [ ] 开机自启动选项
-- [ ] 自定义刷新间隔
-- [ ] 自定义字体大小
+- [ ] 多数据源容灾（东方财富/腾讯 API 备用）
 
 ## License
 
