@@ -64,3 +64,5 @@ coverage.xml
 *.egg
 dist/
 build/
+
+docs/

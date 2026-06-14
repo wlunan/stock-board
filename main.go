@@ -16,7 +16,6 @@ import (
 	"time"
 	"unicode/utf8"
 	"unsafe"
-
 	"golang.org/x/sys/windows"
 )
 
@@ -241,8 +240,9 @@ type Config struct {
 	Width           int         `json:"width"`
 	Height          int         `json:"height"`
 	ColorMode       string      `json:"color_mode"`       // "red_up"=涨红跌绿(默认), "green_up"=涨绿跌红
-	RefreshInterval int         `json:"refresh_interval"` // 刷新间隔（秒），默认 5
+	RefreshInterval int         `json:"refresh_interval"` // 刷新间隔（秒），默认 30
 	FontSize        int         `json:"font_size"`        // 字体大小，默认 18
+	SkipNonTradingHours *bool   `json:"skip_non_trading_hours,omitempty"` // true=非交易时段不刷新(默认), false=始终刷新
 }
 
 var (
@@ -311,7 +311,7 @@ func defaultConfig() Config {
 		PosY:            100,
 		Width:           w,
 		Height:          h,
-		RefreshInterval: 5,
+		RefreshInterval: 30,
 		FontSize:        18,
 	}
 }
@@ -339,10 +339,14 @@ func loadConfig() {
 		config.Width, config.Height = calcSize(len(config.Stocks), config.FontSize)
 	}
 	if config.RefreshInterval < 1 {
-		config.RefreshInterval = 5
+		config.RefreshInterval = 30
 	}
 	if config.FontSize < 10 {
 		config.FontSize = 18
+	}
+	if config.SkipNonTradingHours == nil {
+		v := true
+		config.SkipNonTradingHours = &v
 	}
 	// 记录文件修改时间
 	if fi, err := os.Stat(configPath); err == nil {
@@ -372,6 +376,9 @@ func decodeSinaBody(body []byte) string {
 }
 
 func isAShareTradingTime() bool {
+	if !*config.SkipNonTradingHours {
+		return true
+	}
 	now := time.Now()
 	wd := now.Weekday()
 	if wd == time.Saturday || wd == time.Sunday {
@@ -383,6 +390,9 @@ func isAShareTradingTime() bool {
 }
 
 func isHKTradingTime() bool {
+	if !*config.SkipNonTradingHours {
+		return true
+	}
 	now := time.Now()
 	wd := now.Weekday()
 	if wd == time.Saturday || wd == time.Sunday {
@@ -394,6 +404,9 @@ func isHKTradingTime() bool {
 }
 
 func isGoldTradingTime() bool {
+	if !*config.SkipNonTradingHours {
+		return true
+	}
 	now := time.Now()
 	wd := now.Weekday()
 	if wd == time.Saturday {
@@ -436,16 +449,10 @@ func fetchGoldPrice() StockData {
 	}
 	// 取第一个品种（今日金价）
 	m := gr.Metals[0]
-	sellPrice, _ := strconv.ParseFloat(m.SellPrice, 64)
 	todayPrice, _ := strconv.ParseFloat(m.TodayPrice, 64)
-	pct := 0.0
-	if todayPrice > 0 {
-		pct = ((sellPrice - todayPrice) / todayPrice) * 100
-	}
 	sd.Name = "黄金(人民币)"
-	sd.Price = sellPrice
-	sd.Change = sellPrice - todayPrice
-	sd.ChangePct = pct
+	sd.Price = todayPrice
+	// 该 API 不提供昨日价格，无法计算真实涨跌幅
 	return sd
 }
 
@@ -636,6 +643,10 @@ func reloadConfigIfChanged() bool {
 		newCfg.ColorMode = config.ColorMode
 	}
 	config = newCfg
+	if config.SkipNonTradingHours == nil {
+		v := true
+		config.SkipNonTradingHours = &v
+	}
 	configMTime = fi.ModTime()
 	// 更新窗口样式和大小
 	updateWindowStyle()

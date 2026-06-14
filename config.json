@@ -29,13 +29,14 @@
       "name": "黄金(人民币)"
     }
   ],
-  "top_most": false,
-  "opacity": 70,
-  "pos_x": 1458,
-  "pos_y": 870,
-  "width": 370,
-  "height": 202,
+  "top_most": true,
+  "opacity": 100,
+  "pos_x": 2066,
+  "pos_y": 1106,
+  "width": 472,
+  "height": 260,
   "color_mode": "red_up",
-  "refresh_interval": 5,
-  "font_size": 20
+  "refresh_interval": 30,
+  "font_size": 25,
+  "skip_non_trading_hours": false
 }
